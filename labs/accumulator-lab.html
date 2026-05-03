@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Accumulator Lab — motion-test-kit</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 13px system-ui, sans-serif; overflow: hidden; }
+  #hud {
+    position: fixed; top: 12px; left: 12px;
+    background: rgba(0,0,0,0.6); padding: 12px 16px; border-radius: 4px;
+    line-height: 1.5; pointer-events: none; min-width: 280px;
+  }
+  #hud h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  #hud span { color: #6cf; }
+  #hud em { font-style: normal; color: #aaa; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>Accumulator Lab</h1>
+  Frame: <span id="frame">0</span><br>
+  RAF dt (ms): <span id="rafDt">—</span><br>
+  Sim steps run total: <span id="simSteps">0</span><br>
+  Sim steps this frame: <span id="simStepsFrame">0</span><br>
+  Alpha: <span id="alpha">—</span><br>
+  <em>Cube: fixed-step rotation @ 1 rad/s · sim-tick</em><br>
+  <em>Sphere: variable-dt sine bob · render-time</em>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { createAccumulator } from '../core/loop/accumulator.js';
+import { bindToRAF } from '../adapters/three/three-loop-binding.js';
+
+// ─── Scene ────────────────────────────────────────────────────────────────
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 1.5, 5);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const cube = new THREE.Mesh(
+  new THREE.BoxGeometry(1, 1, 1),
+  new THREE.MeshStandardMaterial({ color: 0x6cf })
+);
+cube.position.x = -1.5;
+scene.add(cube);
+
+const sphere = new THREE.Mesh(
+  new THREE.SphereGeometry(0.5, 32, 16),
+  new THREE.MeshStandardMaterial({ color: 0xfa6 })
+);
+sphere.position.x = 1.5;
+scene.add(sphere);
+
+scene.add(new THREE.AmbientLight(0x404040));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(2, 3, 2);
+scene.add(dir);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ─── Sim state ────────────────────────────────────────────────────────────
+// `cubeAngle` advances at 1 rad/s, fixed step. The sim is the authority for
+// this value; the cube reads it on render.
+let cubeAngle = 0;
+let simStepsTotal = 0;
+let simStepsThisFrame = 0;
+let frame = 0;
+let lastRafDt = 0;
+
+// ─── Accumulator + binding ────────────────────────────────────────────────
+const accumulator = createAccumulator({ stepMs: 16.667, maxStepMs: 200 });
+
+const ctrl = bindToRAF({
+  accumulator,
+  simUpdate(stepMs) {
+    // Advance sim by exactly stepMs of simulated time.
+    cubeAngle += (1.0) * (stepMs / 1000);  // 1 rad/sec
+    simStepsTotal++;
+    simStepsThisFrame++;
+  },
+  render(alpha) {
+    simStepsThisFrame = 0;  // reset; will be repopulated next sim batch
+    frame++;
+    // Render-time variable: sphere bobs sinusoidally based on real wall-clock.
+    // Demonstrates the divide between sim-tick state (cube) and render-tick
+    // state (sphere). For real games, cube-style values use sim dt; sphere-
+    // style purely-cosmetic values (animations, particles, screen-space
+    // effects) can use real-dt safely without affecting determinism.
+    const tNow = performance.now();
+    sphere.position.y = Math.sin(tNow * 0.003) * 0.5;
+    cube.rotation.y = cubeAngle;
+    renderer.render(scene, camera);
+    // HUD
+    document.getElementById('frame').textContent = String(frame);
+    document.getElementById('rafDt').textContent = lastRafDt.toFixed(2);
+    document.getElementById('simSteps').textContent = String(simStepsTotal);
+    document.getElementById('simStepsFrame').textContent = String(simStepsThisFrame);
+    document.getElementById('alpha').textContent = alpha.toFixed(3);
+  },
+});
+
+// Capture rAF dt for the HUD (ergonomic; not required by the kit).
+let lastT = performance.now();
+function tickHud(t) {
+  lastRafDt = t - lastT;
+  lastT = t;
+  requestAnimationFrame(tickHud);
+}
+requestAnimationFrame(tickHud);
+
+ctrl.start();
+
+// ─── Expose lab state for telemetry / chrome-devtools inspection ──────────
+window._motionTestKit = {
+  lab: {
+    get frameCount() { return frame; },
+    get simStepsTotal() { return simStepsTotal; },
+    get cubeAngle() { return cubeAngle; },
+    get accumulated() { return accumulator.accumulated(); },
+    accumulator,
+    controller: ctrl,
+  },
+};
+</script>
+</body>
+</html>
