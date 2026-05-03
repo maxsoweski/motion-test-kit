@@ -1,0 +1,169 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>three-vite-smoke — motion-test-kit example</title>
+<style>
+  body { margin: 0; background: #0a0a14; color: #cfd; font: 13px system-ui; overflow: hidden; }
+  #hud {
+    position: fixed; top: 12px; left: 12px;
+    background: rgba(0,0,0,0.7); padding: 12px 16px; border-radius: 4px;
+    line-height: 1.6; min-width: 320px; pointer-events: none;
+  }
+  h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  span { color: #6cf; }
+  em { font-style: normal; color: #aaa; }
+  canvas { display: block; }
+  .pass { color: #6f6; }
+  .fail { color: #f66; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>motion-test-kit — three-vite-smoke example</h1>
+  Frame: <span id="frame">0</span><br>
+  Sim steps run: <span id="simSteps">0</span><br>
+  NPC ship distance to station: <span id="dist">—</span><br>
+  Approach phase invariant: <span id="approach">—</span><br>
+  Δ-magnitude bound (no spike): <span id="delta">—</span><br>
+  Monotonicity (no oscillation): <span id="mono">—</span><br>
+  <em>Ship cubes: NPC moving toward station (target). Predicates run live on the recorded sample stream. Demonstrates the kit working in a non-well-dipper scene.</em>
+</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+// Imports through the kit's package — same path the well-dipper Vite alias
+// resolves to. This file is served by the kit's labs/serve.js at
+// http://localhost:5174/examples/three-vite-smoke/index.html so the
+// relative imports work without any vite alias setup of its own.
+import { createAccumulator } from '../../core/loop/accumulator.js';
+import { bindToRAF } from '../../adapters/three/three-loop-binding.js';
+import { createRingBuffer } from '../../core/recorder/ring-buffer.js';
+import { bindCaptureToBuffer } from '../../adapters/three/sample-capture.js';
+import {
+  deltaMagnitudeBound,
+  monotonicityScore,
+  approachPhaseInvariant,
+} from '../../core/predicates/index.js';
+
+// ── Synthetic scene: an NPC ship cube moves toward a station cube ────────
+// Demonstrates the kit's track-A-relative-to-B abstraction (anchor = NPC
+// ship, target = station). Predicates assert the ship's approach is
+// well-behaved. Zero well-dipper concepts.
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 4, 12);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(devicePixelRatio);
+document.body.appendChild(renderer.domElement);
+
+const station = new THREE.Mesh(
+  new THREE.BoxGeometry(1.5, 1.5, 1.5),
+  new THREE.MeshStandardMaterial({ color: 0xaa88ff })
+);
+station.position.set(5, 0, 0);
+scene.add(station);
+
+const npcShip = new THREE.Mesh(
+  new THREE.BoxGeometry(0.6, 0.4, 1),
+  new THREE.MeshStandardMaterial({ color: 0x66ddee })
+);
+npcShip.position.set(-5, 0, 0);
+scene.add(npcShip);
+
+scene.add(new THREE.AmbientLight(0x404044));
+const dir = new THREE.DirectionalLight(0xffffff, 1.0);
+dir.position.set(2, 5, 3);
+scene.add(dir);
+
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ── Sim ──
+let simSteps = 0;
+let frameIdx = 0;
+const buffer = createRingBuffer({ capacity: 600 });
+const cap = bindCaptureToBuffer({ buffer });
+const acc = createAccumulator({ stepMs: 16.667 });
+
+const ctrl = bindToRAF({
+  accumulator: acc,
+  simUpdate(stepMs) {
+    // NPC ship moves toward station at 0.5 units/sec, decelerating as
+    // it approaches.
+    const distToStation = npcShip.position.distanceTo(station.position);
+    if (distToStation > 0.1) {
+      const speed = Math.max(0.05, distToStation * 0.5) * (stepMs / 1000);
+      const dir = new THREE.Vector3().subVectors(station.position, npcShip.position).normalize();
+      npcShip.position.addScaledVector(dir, speed);
+      // Orient ship toward station
+      npcShip.lookAt(station.position);
+    }
+    simSteps++;
+  },
+  render(alpha) {
+    // Capture a kit-shape sample (frame index auto-incremented by adapter)
+    cap.tick(performance.now(), npcShip, {
+      target: station,
+      input: {},
+      state: { phase: 'APPROACH' },
+    });
+    frameIdx++;
+    renderer.render(scene, camera);
+
+    // Run predicates over the recorded buffer every ~30 frames.
+    if (frameIdx % 30 === 0 && buffer.size() >= 30) {
+      const samples = buffer.snapshot();
+      const dPred = deltaMagnitudeBound(samples, { axis: 'x', bound: 0.5 });
+      const mPred = monotonicityScore(samples, { axis: 'x', windowFrames: 30 });
+      const aPred = approachPhaseInvariant(samples, { phaseStart: 0, phaseEnd: samples.length });
+      document.getElementById('delta').innerHTML =
+        dPred.passed ? '<span class="pass">PASS</span>' : `<span class="fail">FAIL (${dPred.violations.length})</span>`;
+      document.getElementById('mono').innerHTML =
+        mPred.passed ? '<span class="pass">PASS</span>' : `<span class="fail">FAIL (${mPred.violations.length})</span>`;
+      document.getElementById('approach').innerHTML =
+        aPred.passed ? '<span class="pass">PASS</span>' : `<span class="fail">FAIL (${aPred.violations.length})</span>`;
+    }
+
+    // HUD updates
+    document.getElementById('frame').textContent = String(frameIdx);
+    document.getElementById('simSteps').textContent = String(simSteps);
+    document.getElementById('dist').textContent =
+      npcShip.position.distanceTo(station.position).toFixed(3);
+  },
+});
+ctrl.start();
+
+// Expose for chrome-devtools + node verifiers
+window._motionTestKit = {
+  example: {
+    get frameCount() { return frameIdx; },
+    get simSteps() { return simSteps; },
+    get bufferSize() { return buffer.size(); },
+    snapshot: () => buffer.snapshot(),
+    runPredicates: () => {
+      const s = buffer.snapshot();
+      return {
+        deltaMagnitudeBound: deltaMagnitudeBound(s, { axis: 'x', bound: 0.5 }),
+        monotonicityScore: monotonicityScore(s, { axis: 'x', windowFrames: 30 }),
+        approachPhaseInvariant: approachPhaseInvariant(s, { phaseStart: 0, phaseEnd: s.length }),
+      };
+    },
+  },
+};
+</script>
+</body>
+</html>

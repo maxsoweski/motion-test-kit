@@ -163,13 +163,32 @@ The "no build step" claim still holds — the labs are static files served
 verbatim. The HTTP server is just there because browsers don't allow
 ES modules over file://.
 
-## Status field per phase (move down as phases land)
+## Phase status
 
-- Phase 1 (Repo + Accumulator): in progress
-- Phase 2 (Predicates + Flight Recorder): not started
-- Phase 3 (RNG + Input Replay): not started
-- Phase 4 (Transform-Hash): not started
-- Phase 5 (Integration + Persona Update): not started
+- ✓ **Phase 1** (Repo + Accumulator) — `dce61b1`
+- ✓ **Phase 2** (Predicates + Flight Recorder) — `c6486b0`
+- ✓ **Phase 3** (RNG + Input Replay) — `d0a6202`
+- ✓ **Phase 4** (Transform-Hash + Golden Trajectory) — `f645d2e`
+- ✓ **Phase 5** (Cross-project example + Tester persona update + dogfood)
+
+74 self-tests pass under `npm test`.
+
+## Dogfood result (toggle-fix AC #4 re-verification)
+
+The kit was scoped after a working-Claude-and-Tester PASS verdict on a
+toggle-fix workstream that Max immediately saw was broken — the
+recording showed teleport-cycle motion that coarse 3-point sampling
+hadn't measured. AC #23 of this workstream re-runs the toggle-fix
+scenarios through kit predicates.
+
+Result: `deltaMagnitudeBound` and `monotonicityScore` flag the
+teleport-cycle on every pre-fix capture (3145 violations on Sol A,
+including a 255 scene-unit single-frame Z spike; 6924-unit spike in Sol
+B). The bug class the original verification missed is structurally
+caught by the predicates.
+
+Per-capture results in
+`~/projects/well-dipper/tests/motion-test-kit-dogfood-2026-05-02.js`.
 
 ## License
 
