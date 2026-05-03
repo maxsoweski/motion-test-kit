@@ -11,6 +11,7 @@
     "./core/predicates/errors": "./core/predicates/errors.js",
     "./core/math/vec3": "./core/math/vec3.js",
     "./adapters/dom/blob-download-writer": "./adapters/dom/blob-download-writer.js",
+    "./adapters/dom/keyboard-mouse-bridge": "./adapters/dom/keyboard-mouse-bridge.js",
     "./adapters/node/fs-writer": "./adapters/node/fs-writer.js",
     "./core/rng/mulberry32": "./core/rng/mulberry32.js",
     "./core/replay/input-recorder": "./core/replay/input-recorder.js",
