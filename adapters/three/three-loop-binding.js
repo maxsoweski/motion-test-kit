@@ -63,7 +63,16 @@ export function bindToRAF(options) {
 
   function frame(t) {
     if (!running) return;
-    const dt = t - lastT;
+    // Clamp dt to ≥ 0. The very first rAF callback's `t` can be slightly
+    // less than the `lastT = now()` set inside start() because browsers
+    // may stamp rAF callbacks with a timestamp captured before the
+    // scheduling moment, while `now()` returns the value at the
+    // scheduling moment itself. Net dt can land negative by a fraction
+    // of a millisecond on the first frame. The accumulator validates
+    // strictly (catches real bugs); we absorb the harmless first-frame
+    // ordering quirk here so the strict accumulator check still fires
+    // for genuinely-negative inputs (e.g., NaN, broken now()).
+    const dt = Math.max(0, t - lastT);
     lastT = t;
     const { alpha } = accumulator.tick(dt, simUpdate);
     render(alpha);
