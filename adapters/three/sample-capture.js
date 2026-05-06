@@ -54,7 +54,7 @@ export function captureFrame(options) {
   const ap = anchor.position;
   const aq = anchor.quaternion;
 
-  return {
+  const record = {
     frame: options.frame,
     t: options.t,
     dt: options.dt ?? 0,
@@ -71,6 +71,8 @@ export function captureFrame(options) {
     input: options.input || {},
     state: options.state || {},
   };
+  if (options.inventory) record.inventory = options.inventory;
+  return record;
 }
 
 /**
@@ -100,6 +102,7 @@ export function bindCaptureToBuffer(options) {
         target: extras?.target,
         input: extras?.input,
         state: extras?.state,
+        inventory: extras?.inventory,
       });
       buffer.push(sample);
       frame++;

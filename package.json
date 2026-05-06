@@ -23,7 +23,10 @@
     "./adapters/node/fs-writer": "./adapters/node/fs-writer.js",
     "./adapters/node/fs-reader": "./adapters/node/fs-reader.js",
     "./core/inventory/errors": "./core/inventory/errors.js",
-    "./adapters/three/scene-inventory": "./adapters/three/scene-inventory.js"
+    "./adapters/three/scene-inventory": "./adapters/three/scene-inventory.js",
+    "./adapters/dom/overlay-registry": "./adapters/dom/overlay-registry.js",
+    "./core/inventory/predicates": "./core/inventory/predicates.js",
+    "./core/inventory/diff": "./core/inventory/diff.js"
   },
   "scripts": {
     "test": "node --test tests/*.test.js",

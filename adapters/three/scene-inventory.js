@@ -183,7 +183,7 @@ export function takeSceneInventory(options) {
   // Composer passes
   if (options.composer && Array.isArray(options.composer.passes)) {
     inv.composerPasses = options.composer.passes.map((p) => ({
-      name: p?.constructor?.name || p?.name || 'unknown',
+      name: (p?.constructor?.name && p.constructor.name !== 'Object') ? p.constructor.name : (p?.name || 'unknown'),
       enabled: p?.enabled !== false,
       renderToScreen: !!p?.renderToScreen,
       needsSwap: p?.needsSwap !== false,
@@ -359,4 +359,134 @@ export function invertMatrix4(m) {
   out[14] = (a31 * b01 - a30 * b03 - a32 * b00) * invDet;
   out[15] = (a20 * b03 - a21 * b01 + a22 * b00) * invDet;
   return out;
+}
+
+
+// ── Cadence helpers (AC #11) ────────────────────────────────────────────
+//
+// Three sampling cadences for inventory snapshots. Each wraps a recorder
+// (returned by bindCaptureToBuffer) and decides per-tick whether to attach
+// an inventory snapshot to the just-pushed sample. The recorder's own
+// frame counting + buffer-push semantics are unchanged; the wrapper only
+// adds inventory.
+//
+// Cost characterization (research §6, well-dipper-scale ~hundreds of meshes):
+//
+//   everyFrame:    ~30-60 ms/sec at 60 Hz (3-6% frame budget)
+//   everyN(N=6):   ~5-10 ms/sec at 60 Hz (~0.5% frame budget)
+//   phaseBoundary: sub-ms per scenario (handful of snapshots total)
+//
+// Default for production tests: phaseBoundary. Use everyN for soak runs
+// where intra-phase regressions matter. Use everyFrame only for short
+// regression captures where temporal resolution is load-bearing.
+
+/**
+ * Read a dotted path from an object. Returns undefined if any segment is
+ * absent. Used by withPhaseBoundaryInventory to monitor state.<phaseField>.
+ *
+ * @param {object | undefined} obj
+ * @param {string | undefined} path
+ * @returns {*}
+ */
+function readPath(obj, path) {
+  if (!path || obj == null) return undefined;
+  const parts = path.split('.');
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null) return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+/**
+ * @typedef {object} CadenceOptions
+ * @property {object} recorder       Returned by bindCaptureToBuffer.
+ * @property {object} scene          Three.js Scene-shaped (passed to takeSceneInventory).
+ * @property {object} camera         Three.js Camera-shaped.
+ * @property {object} [composer]
+ * @property {object} [overlayRegistry]
+ * @property {object} [renderer]
+ * @property {string} [meshNamePrefix]
+ * @property {boolean} [includeBoundingSphere]
+ * @property {boolean} [verbose]
+ *
+ * @typedef {CadenceOptions & { stateFieldPath: string }} PhaseBoundaryCadenceOptions
+ */
+
+/**
+ * Attach inventory only when host's named state field transitions.
+ *
+ * Cheapest cadence: sub-ms per phase boundary; zero cost between transitions.
+ * Default for production tests.
+ *
+ * Caller's tick loop continues to call returned object's tick() like the
+ * underlying recorder's tick(). When state.<stateFieldPath> changes from
+ * the prior tick, takeSceneInventory is called and the snapshot is attached
+ * to that frame's record.
+ *
+ * @param {PhaseBoundaryCadenceOptions} options
+ * @returns {{ tick: typeof options.recorder.tick, frameCount: () => number, reset: () => void }}
+ */
+export function withPhaseBoundaryInventory(options) {
+  if (!options || !options.recorder) throw new Error('withPhaseBoundaryInventory: options.recorder required');
+  if (!options.stateFieldPath) throw new Error('withPhaseBoundaryInventory: options.stateFieldPath required');
+  const { recorder, stateFieldPath, ...invOpts } = options;
+  let lastPhase;
+  let firstTick = true;
+  return {
+    tick(t, anchor, extras) {
+      const sample = recorder.tick(t, anchor, extras);
+      const phase = readPath(extras?.state, stateFieldPath);
+      // Capture on first tick AND on every transition.
+      if (firstTick || phase !== lastPhase) {
+        sample.inventory = takeSceneInventory(invOpts);
+        lastPhase = phase;
+        firstTick = false;
+      }
+      return sample;
+    },
+    frameCount() { return recorder.frameCount(); },
+    reset() { lastPhase = undefined; firstTick = true; recorder.reset(); },
+  };
+}
+
+/**
+ * Attach inventory every N frames.
+ *
+ * Cost: ~1/N of everyFrame's per-second cost. With N=6 at 60 Hz sim,
+ * ~10 inventories/sec — sub-1% frame budget at well-dipper scale.
+ *
+ * @param {number} n
+ * @param {CadenceOptions} options
+ */
+export function everyN(n, options) {
+  if (typeof n !== 'number' || n < 1) throw new Error('everyN: n must be a positive integer');
+  if (!options || !options.recorder) throw new Error('everyN: options.recorder required');
+  const { recorder, ...invOpts } = options;
+  let counter = 0;
+  return {
+    tick(t, anchor, extras) {
+      const sample = recorder.tick(t, anchor, extras);
+      if (counter % n === 0) {
+        sample.inventory = takeSceneInventory(invOpts);
+      }
+      counter++;
+      return sample;
+    },
+    frameCount() { return recorder.frameCount(); },
+    reset() { counter = 0; recorder.reset(); },
+  };
+}
+
+/**
+ * Attach inventory every frame.
+ *
+ * Highest temporal resolution; highest per-second cost (~3-6% frame budget
+ * at 60 Hz with hundreds of meshes). Use for short regression captures only.
+ *
+ * @param {CadenceOptions} options
+ */
+export function everyFrame(options) {
+  return everyN(1, options);
 }
