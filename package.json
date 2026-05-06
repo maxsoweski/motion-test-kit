@@ -1,7 +1,7 @@
 {
   "name": "motion-test-kit",
   "version": "0.1.0",
-  "description": "Engine-agnostic motion-testing kit — predicates, deterministic replay, fixed-timestep accumulator, transform-hash regression, flight-recorder ring buffer. Three.js + DOM adapters; Godot port supported by ports-and-adapters architecture.",
+  "description": "Engine-agnostic motion-testing kit \u2014 predicates, deterministic replay, fixed-timestep accumulator, transform-hash regression, flight-recorder ring buffer. Three.js + DOM adapters; Godot port supported by ports-and-adapters architecture.",
   "type": "module",
   "exports": {
     "./core/loop/accumulator": "./core/loop/accumulator.js",
@@ -21,7 +21,9 @@
     "./adapters/dom/blob-download-writer": "./adapters/dom/blob-download-writer.js",
     "./adapters/dom/keyboard-mouse-bridge": "./adapters/dom/keyboard-mouse-bridge.js",
     "./adapters/node/fs-writer": "./adapters/node/fs-writer.js",
-    "./adapters/node/fs-reader": "./adapters/node/fs-reader.js"
+    "./adapters/node/fs-reader": "./adapters/node/fs-reader.js",
+    "./core/inventory/errors": "./core/inventory/errors.js",
+    "./adapters/three/scene-inventory": "./adapters/three/scene-inventory.js"
   },
   "scripts": {
     "test": "node --test tests/*.test.js",
