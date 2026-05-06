@@ -1,8 +1,8 @@
 # motion-test-kit
 
-Engine-agnostic motion-testing kit. Five techniques — predicates, fixed-timestep
+Engine-agnostic motion-testing kit. Six techniques — predicates, fixed-timestep
 accumulator, seeded RNG + input replay, transform-hash regression, flight-recorder
-ring buffer — packaged as a portable library with Three.js + DOM adapters and
+ring buffer, scene-inventory snapshots — packaged as a portable library with Three.js + DOM adapters and
 a Godot port supported by the architecture.
 
 **Status:** Phase 1 (accumulator) landing. Phases 2-5 in flight per
@@ -57,7 +57,7 @@ contract is enforced by review. Violating this commits us to a Three.js
 port instead of a Godot port — the original Godot-portability promise
 gets paid.
 
-## Five techniques
+## Six techniques
 
 | # | Module | Purpose |
 |---|--------|---------|
@@ -66,8 +66,9 @@ gets paid.
 | 3 | `core/rng/mulberry32.js` + `core/replay/` | Seeded RNG + input event recording/playback for byte-equivalent reruns (same machine; cross-machine via #4 tolerance bands) |
 | 4 | `core/hash/` | Transform-hash regression — FNV-1a over quantized trajectory states, tolerance-band comparison (Box2D pattern) |
 | 5 | `core/recorder/ring-buffer.js` | Flight-recorder — last-N-frames ring buffer that dumps to JSON on predicate failure |
+| 6 | `core/inventory/` + `adapters/three/scene-inventory.js` + `adapters/dom/overlay-registry.js` | Scene-inventory snapshots — pure-data records of which meshes are visible-and-in-frustum, which DOM overlays are showing, which composer passes are enabled, plus renderer.info aggregates. Predicates: `meshVisibleAt`, `overlayVisibleAt`, `passEnabledAt`, `drawCallBudget`, plus `diffInventories` for "what changed between phase A and phase B." See `runbooks/06-scene-inventory.md`. |
 
-Dependencies: #2 enables #3 enables #4. #1 and #5 are independent.
+Dependencies: #2 enables #3 enables #4. #1, #5, and #6 are independent of each other.
 
 ## Consuming the kit
 
@@ -170,8 +171,9 @@ ES modules over file://.
 - ✓ **Phase 3** (RNG + Input Replay) — `d0a6202`
 - ✓ **Phase 4** (Transform-Hash + Golden Trajectory) — `f645d2e`
 - ✓ **Phase 5** (Cross-project example + Tester persona update + dogfood)
+- ✓ **Technique #6** (Scene-inventory) — `motion-test-kit-scene-inventory-2026-05-05` brief in well-dipper repo
 
-74 self-tests pass under `npm test`.
+159 self-tests pass under `npm test`.
 
 ## Dogfood result (toggle-fix AC #4 re-verification)
 

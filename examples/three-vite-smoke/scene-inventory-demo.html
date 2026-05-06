@@ -1,0 +1,192 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>scene-inventory-demo — motion-test-kit technique #6</title>
+<style>
+  body { margin: 0; background: #0a0a14; color: #cfd; font: 13px system-ui; overflow: hidden; }
+  #hud {
+    position: fixed; top: 12px; left: 12px;
+    background: rgba(0,0,0,0.7); padding: 12px 16px; border-radius: 4px;
+    line-height: 1.6; min-width: 360px; pointer-events: none;
+  }
+  h1 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  span { color: #6cf; }
+  em { font-style: normal; color: #aaa; }
+  canvas { display: block; }
+  .pass { color: #6f6; }
+  .fail { color: #f66; }
+  /* Test-target overlays — toggled by the demo loop */
+  .overlay {
+    position: fixed; padding: 8px 12px; background: rgba(80,160,255,0.85);
+    color: #001; border-radius: 3px; font-weight: 600;
+  }
+  #hud-panel { top: 12px; right: 12px; }
+  #status-bar { bottom: 12px; left: 50%; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+<div id="hud">
+  <h1>technique #6 — scene-inventory snapshots</h1>
+  Phase: <span id="phase">init</span><br>
+  Mesh count (visible): <span id="mesh-count">0</span><br>
+  meshVisibleAt('phaseA', 'planet'): <span id="planet-a">—</span><br>
+  meshVisibleAt('phaseB', 'planet'): <span id="planet-b">—</span><br>
+  overlayHiddenAt('phaseA', 'hud-panel'): <span id="hud-a">—</span><br>
+  overlayVisibleAt('phaseB', 'hud-panel'): <span id="hud-b">—</span><br>
+  diffInventories(A, B): <span id="diff">—</span><br>
+  <em>Generic 3-mesh scene + 2 DOM overlays. Two phase boundaries (phaseA, phaseB). Predicates run live; check page console for full output.</em>
+</div>
+<div class="overlay" id="hud-panel">HUD</div>
+<div class="overlay" id="status-bar">Status</div>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { takeSceneInventory } from '../../adapters/three/scene-inventory.js';
+import { createOverlayRegistry } from '../../adapters/dom/overlay-registry.js';
+import {
+  meshVisibleAt,
+  meshHiddenAt,
+  overlayVisibleAt,
+  overlayHiddenAt,
+  passEnabledAt,
+  drawCallBudget,
+} from '../../core/inventory/predicates.js';
+import { diffInventories } from '../../core/inventory/diff.js';
+
+// ── Synthetic scene: 3 generic-named meshes + 2 DOM overlays ─────────────
+// No well-dipper concepts. Generic names: planet, moon, ship-icon. The
+// demo cycles between two phase states (phaseA, phaseB):
+//   phaseA: planet visible + ship-icon visible, moon hidden, hud-panel hidden
+//   phaseB: planet hidden,   ship-icon visible, moon visible, hud-panel visible
+// Two snapshots taken; predicates run on each plus diffInventories between.
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 0, 5);
+camera.lookAt(0, 0, 0);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.info.autoReset = false; // stable per-tick aggregates per inventory-shape.md
+document.body.appendChild(renderer.domElement);
+
+// 3 named meshes — generic, project-agnostic names.
+const planet = new THREE.Mesh(
+  new THREE.SphereGeometry(0.8, 16, 16),
+  new THREE.MeshBasicMaterial({ color: 0x4488ff }),
+);
+planet.name = 'planet';
+planet.position.set(-1.5, 0, 0);
+scene.add(planet);
+
+const moon = new THREE.Mesh(
+  new THREE.SphereGeometry(0.3, 12, 12),
+  new THREE.MeshBasicMaterial({ color: 0xcccccc }),
+);
+moon.name = 'moon';
+moon.position.set(1.5, 0, 0);
+scene.add(moon);
+
+const shipIcon = new THREE.Mesh(
+  new THREE.ConeGeometry(0.3, 0.6, 8),
+  new THREE.MeshBasicMaterial({ color: 0xff8844 }),
+);
+shipIcon.name = 'ship-icon';
+shipIcon.position.set(0, 0.5, 0);
+scene.add(shipIcon);
+
+// Compute bounding spheres so frustum tests work
+planet.geometry.computeBoundingSphere();
+moon.geometry.computeBoundingSphere();
+shipIcon.geometry.computeBoundingSphere();
+
+// Update matrices once
+scene.updateMatrixWorld(true);
+
+// 2 DOM overlays — use lazy resolver to handle re-mount cycles
+const registry = createOverlayRegistry();
+registry.register('hud-panel', '#hud-panel');
+registry.register('status-bar', '#status-bar');
+
+// Helper: set phase A or B by toggling visibility
+function setPhase(phase) {
+  if (phase === 'phaseA') {
+    planet.visible = true;
+    moon.visible = false;
+    shipIcon.visible = true;
+    document.getElementById('hud-panel').style.display = 'none';
+    document.getElementById('status-bar').style.display = 'block';
+  } else {
+    planet.visible = false;
+    moon.visible = true;
+    shipIcon.visible = true;
+    document.getElementById('hud-panel').style.display = 'block';
+    document.getElementById('status-bar').style.display = 'block';
+  }
+}
+
+// Capture inventory at each phase. Single render between phase changes
+// to populate renderer.info.
+function captureAt(phase) {
+  setPhase(phase);
+  scene.updateMatrixWorld(true);
+  renderer.render(scene, camera);
+  return takeSceneInventory({ scene, camera, overlayRegistry: registry, renderer });
+}
+
+// Capture both phases
+const invA = captureAt('phaseA');
+const invB = captureAt('phaseB');
+const inventoriesByPhase = new Map([['phaseA', invA], ['phaseB', invB]]);
+
+// Run predicates
+const r1 = meshVisibleAt(inventoriesByPhase, { phaseKey: 'phaseA', meshName: 'planet' });
+const r2 = meshVisibleAt(inventoriesByPhase, { phaseKey: 'phaseB', meshName: 'planet' }); // expected FAIL
+const r3 = overlayHiddenAt(inventoriesByPhase, { phaseKey: 'phaseA', overlayId: 'hud-panel' });
+const r4 = overlayVisibleAt(inventoriesByPhase, { phaseKey: 'phaseB', overlayId: 'hud-panel' });
+const r5 = drawCallBudget(inventoriesByPhase, { max: 100 });
+
+const diff = diffInventories(invA, invB);
+
+// Update HUD
+document.getElementById('phase').textContent = 'phaseA → phaseB captured';
+document.getElementById('mesh-count').textContent = `A: ${invA.meshes.filter(m => m.visible).length}, B: ${invB.meshes.filter(m => m.visible).length}`;
+const setResult = (id, r) => {
+  const el = document.getElementById(id);
+  el.textContent = r.passed ? 'PASS' : 'FAIL';
+  el.className = r.passed ? 'pass' : 'fail';
+};
+setResult('planet-a', r1);  // expected PASS
+setResult('planet-b', r2);  // expected FAIL (planet hidden in phaseB)
+setResult('hud-a', r3);     // expected PASS
+setResult('hud-b', r4);     // expected PASS
+
+document.getElementById('diff').textContent = `appeared: [${diff.appearedMeshes.join(',')}], disappeared: [${diff.disappearedMeshes.join(',')}]`;
+
+// Console output
+console.log('[technique #6 demo] Inventory A (phaseA):', invA);
+console.log('[technique #6 demo] Inventory B (phaseB):', invB);
+console.log('[technique #6 demo] meshVisibleAt phaseA planet → ', r1);
+console.log('[technique #6 demo] meshVisibleAt phaseB planet (expected FAIL — hidden) → ', r2);
+console.log('[technique #6 demo] overlayHiddenAt phaseA hud-panel → ', r3);
+console.log('[technique #6 demo] overlayVisibleAt phaseB hud-panel → ', r4);
+console.log('[technique #6 demo] drawCallBudget {max:100} → ', r5);
+console.log('[technique #6 demo] diffInventories(A, B) → ', diff);
+
+// Expose for chrome-devtools poll-based verification
+window._motionTestKit = window._motionTestKit || {};
+window._motionTestKit.sceneInventoryDemo = {
+  inventoriesByPhase,
+  diff,
+  results: { r1, r2, r3, r4, r5 },
+};
+</script>
+</body>
+</html>
