@@ -21,6 +21,11 @@ serializable, contain no engine references, and survive
  * @property {string} type           'Mesh' | 'Points' | 'Sprite' | 'Line' | ...
  * @property {string} uuid           Stable identity across frames. Useful
  *                                   for diff API.
+ * @property {string} source         Source scene name (e.g. 'main', 'sky')
+ *                                   from the multi-scene `scenes:[]` input.
+ *                                   Predicates can scope by source via
+ *                                   `options.source`. Legacy `{scene,camera}`
+ *                                   shape produces `source: 'main'`.
  * @property {boolean} visible       Object3D.visible (own; chain visibility
  *                                   is resolved by traverseVisible filtering
  *                                   before this entry is emitted).
@@ -65,8 +70,87 @@ serializable, contain no engine references, and survive
  * @property {number} geometries
  * @property {number} textures
  *
+ * @typedef {object} CameraInventoryEntry
+ * @property {string} name           e.g. 'camera.player'.
+ * @property {string} type           'PerspectiveCamera' | 'OrthographicCamera' | …
+ * @property {string} uuid
+ * @property {string} source         Source scene tag (see MeshInventoryEntry).
+ * @property {number|null} fov       PerspectiveCamera fov (degrees).
+ * @property {number|null} aspect
+ * @property {number|null} near
+ * @property {number|null} far
+ * @property {boolean} isOrthographic
+ * @property {[number, number, number]} worldPos
+ *
+ * @typedef {object} LightInventoryEntry
+ * @property {string} name           e.g. 'light.star.sol'.
+ * @property {string} type           'AmbientLight' | 'DirectionalLight' | …
+ * @property {string} uuid
+ * @property {string} source
+ * @property {boolean} visible
+ * @property {number} intensity
+ * @property {string} color          6-char hex (e.g. 'ffaa33'). '' when
+ *                                   light has no color (rare).
+ * @property {[number, number, number]} worldPos
+ *
+ * @typedef {object} MaterialInventoryEntry
+ * @property {string} role           Stable identifier; lookup key for
+ *                                   uniformValueAt (e.g. 'warp.tunnel').
+ * @property {Record<string, any>} uniforms
+ *                                   Captured uniform values per host's
+ *                                   declared watchlist. A uniform declared
+ *                                   in `watch` but absent from the material
+ *                                   at capture time is recorded as `null`
+ *                                   (distinct from a uniform with literal
+ *                                   value 0). `uniformValueAt` distinguishes
+ *                                   these failure modes.
+ * @property {boolean} transparent
+ * @property {boolean} depthTest
+ * @property {boolean} depthWrite
+ * @property {number|null} blending
+ * @property {boolean} visible
+ *
+ * @typedef {object} RenderTargetInventoryEntry
+ * @property {string} name
+ * @property {number} width
+ * @property {number} height
+ * @property {boolean} depthBuffer
+ * @property {number} samples       MSAA sample count (0 = single-sample).
+ * @property {string} textureUuid
+ *
+ * @typedef {object} AudioInventoryEntry
+ * @property {string} track
+ * @property {boolean} isPlaying
+ * @property {number} currentTime   Seconds.
+ * @property {number} volume         0..1.
+ *
  * @typedef {object} SceneInventory
  * @property {MeshInventoryEntry[]} meshes
+ * @property {CameraInventoryEntry[]} cameras
+ *                                   All cameras traversed across all input
+ *                                   scenes plus the explicit per-scene camera.
+ *                                   Always present (may be empty).
+ * @property {LightInventoryEntry[]} lights
+ *                                   All `.isLight === true` objects traversed
+ *                                   across all input scenes. Always present.
+ * @property {MaterialInventoryEntry[]} [materials]
+ *                                   Omitted when no `materials:` watchlist
+ *                                   was passed.
+ * @property {Record<string, number>} [clocks]
+ *                                   Host-supplied named numerical clocks.
+ *                                   Omitted when not provided.
+ * @property {Record<string, string>} [modes]
+ *                                   Host-supplied named mode flags. Omitted
+ *                                   when not provided.
+ * @property {RenderTargetInventoryEntry[]} [renderTargets]
+ *                                   Host-supplied named render targets.
+ * @property {Record<string, string>} [phases]
+ *                                   Host-supplied state-machine phases per
+ *                                   system. Used by phaseEquals for cross-
+ *                                   system coherence assertions.
+ * @property {AudioInventoryEntry[]} [audio]
+ *                                   Per-track audio playback state.
+ * @property {object} [input]        Plain JSON-serializable input-layer state.
  * @property {OverlayInventoryEntry[]} [domOverlays]
  *                                   Omitted (not [] empty) when no overlay
  *                                   registry was passed. Distinguishes "host
@@ -103,13 +187,22 @@ is absent (not `null` — same opt-in convention as `domOverlays` above).
 
 | Predicate | Required fields |
 |-----------|------------------|
-| `meshVisibleAt` | `inventory.meshes[i].name`, `.visible`, `.inFrustum` |
+| `meshVisibleAt` | `inventory.meshes[i].name`, `.visible`, `.inFrustum`, `.source` (when `options.source` is set) |
 | `meshHiddenAt` | same |
 | `overlayVisibleAt` | `inventory.domOverlays[i].id`, `.visible` |
 | `overlayHiddenAt` | same |
 | `passEnabledAt` | `inventory.composerPasses[i].name`, `.enabled` |
 | `drawCallBudget` | `inventory.rendererInfo.drawCalls` |
 | `triangleBudget` | `inventory.rendererInfo.triangles` |
+| `cameraConfigAt` | `inventory.cameras[i].name` + the field(s) listed in `options.expected` |
+| `lightActiveAt` | `inventory.lights[i].name`, `.visible`, `.intensity` |
+| `uniformValueAt` | `inventory.materials[i].role`, `.uniforms[options.uniformName]` |
+| `clockProgressedSince` | `inventoriesByPhase.{phaseKey,sincePhase}.clocks[clockSystem]` (number) |
+| `modeIs` | `inventory.modes[options.slot]` (string) |
+| `renderTargetSize` | `inventory.renderTargets[i].name`, `.width`, `.height` |
+| `phaseEquals` | `inventory.phases[options.system]` (string) |
+| `audioPlayingAt` | `inventory.audio[i].track`, `.isPlaying` |
+| `inputContains` | `inventory.input[options.kind]` (any JSON value) |
 | `diffInventories` (pure) | full `inventory.*` shape on both inputs |
 
 ## Validation
@@ -131,12 +224,50 @@ This separation lets working-Claude's diagnostic loop converge: an
 unnamed-mesh failure points at host naming policy, an entity-not-found
 failure points at scene-graph state.
 
+## Multi-scene API
+
+`takeSceneInventory` accepts two input shapes:
+
+```js
+// Multi-scene (preferred for hosts with separate sky / main / HUD scenes):
+takeSceneInventory({
+  scenes: [
+    { name: 'main', scene: mainScene, camera: mainCamera },
+    { name: 'sky',  scene: skyScene,  camera: skyCamera  },
+  ],
+  // ... shared options ...
+});
+
+// Legacy single-scene:
+takeSceneInventory({ scene, camera, ... });   // equivalent to scenes: [{ name: 'main', scene, camera }]
+```
+
+Each mesh / camera / light entry carries its origin scene's name in
+`source`. Predicates default to "search across all sources"; opt in with
+`{ source: 'sky' }` to scope. `composer`, `renderer`, `overlayRegistry`,
+and the host-supplied categories (materials / clocks / modes / renderTargets
+/ phases / audio / input) are scene-graph-orthogonal — they aren't tagged.
+
+## Bit-stable hash test
+
+The seed:ordinal pattern `fnv1aString(systemSeed + ':' + ordinal)` is
+the recommended host-side ID-construction scheme for procedural entities
+(planets, moons, npcs). Its byte output is part of the kit's public
+contract — every change is save-breaking for hosts that have persisted
+those IDs.
+
+`tests/hash.test.js` pins canonical hex outputs for a fixed set of
+seed:ordinal inputs. The test fails LOUDLY if FNV_OFFSET_BASIS,
+FNV_PRIME, the UTF-16 byte order, or the implementation changes.
+Refactoring the hash becomes a deliberate save-migration decision, not
+an accidental drift.
+
 ## Construction
 
 Hosts construct `SceneInventory` via:
 
 1. **The Three.js adapter** — `adapters/three/scene-inventory.js` exports
-   `takeSceneInventory({ scene, camera, composer?, overlayRegistry?, renderer?, ... })`.
+   `takeSceneInventory({ scenes: [...] /* or scene, camera */, composer?, overlayRegistry?, renderer?, materials?, clocks?, modes?, renderTargets?, phases?, audio?, input?, ... })`.
    See its JSDoc for full options.
 
 2. **Custom construction** — any host can populate a `SceneInventory`

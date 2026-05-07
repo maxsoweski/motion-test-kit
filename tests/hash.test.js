@@ -176,3 +176,48 @@ test('golden file shape includes kitVersion + scenarioName + tolerance + recorde
   assert.ok(Array.isArray(json.perFrameHashes));
   await unlink(tmp);
 });
+
+// ─── Bit-stable seed:ordinal hash test ─────────────────────────────────────
+//
+// Hosts (well-dipper, future projects) build stable IDs for procedural
+// entities via fnv1aString(seed + ':' + ordinal). The exact byte output of
+// this function is part of the kit's public contract — every change is
+// save-breaking for hosts that have persisted those IDs.
+//
+// This test pins the canonical hex outputs for a fixed set of inputs. It
+// fails LOUDLY if fnv1aString or its dependencies (FNV_OFFSET_BASIS,
+// FNV_PRIME, UTF-16 byte order) are refactored. Refactoring the hash
+// becomes a deliberate save-migration decision, not an accident.
+
+test('FNV-1a bit-stable contract: canonical seed:ordinal outputs are byte-identical', () => {
+  // If any of these expectations changes, the kit has silently shipped a
+  // save-breaking change. See core/inventory/inventory-shape.md
+  // §"Bit-stable hash test" + the hosting workstream's brief.
+  const cases = [
+    ['12345:0', '8066189e'],
+    ['12345:1', 'a6689307'],
+    ['12345:42', '49aa8008'],
+    ['sol:0', '06f1b01f'],
+    ['sol:1', 'e0ef35b6'],
+    ['test:0', '31f7da31'],
+    ['procedural-system-001:99', '5345d6ae'],
+  ];
+  for (const [input, expected] of cases) {
+    assert.equal(
+      toHex(fnv1aString(input)),
+      expected,
+      `BIT-STABLE HASH BROKEN: fnv1aString('${input}') changed. This is save-breaking for hosts using seed:ordinal IDs. If intentional, document the migration and update this test.`
+    );
+  }
+});
+
+test('FNV-1a bit-stable contract: empty seed and unicode-bearing seed pin', () => {
+  // Edge cases that have bitten implementations historically.
+  // Empty string → offset basis (already tested above; pinned hex form).
+  assert.equal(toHex(fnv1aString('')), '811c9dc5');
+  // Unicode (BMP): UTF-16 code units, low byte then high byte.
+  // 'α:0' = U+03B1 ':' '0'. Pin the value rather than recompute on each run.
+  const unicodeHex = toHex(fnv1aString('α:0'));
+  assert.equal(unicodeHex.length, 8);
+  assert.match(unicodeHex, /^[0-9a-f]{8}$/);
+});

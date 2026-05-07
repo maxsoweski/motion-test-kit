@@ -44,27 +44,84 @@
  */
 
 /**
+ * @typedef {object} SceneEntry
+ * @property {string} name             Source-tag value applied to every mesh /
+ *                                     camera / light entry collected from this
+ *                                     scene (e.g. 'main', 'sky'). Predicates
+ *                                     can scope by source.
+ * @property {object} scene            Three.js Scene-shaped (duck-typed).
+ *                                     Must expose .traverseVisible(cb) and
+ *                                     .traverse(cb).
+ * @property {object} camera           Three.js Camera-shaped. Must expose
+ *                                     .projectionMatrix.elements (16 floats)
+ *                                     and .matrixWorldInverse.elements OR
+ *                                     .matrixWorld.elements (we invert).
+ *
+ * @typedef {object} MaterialWatchEntry
+ * @property {string} role             Stable identifier for predicate lookups
+ *                                     (e.g. 'warp.tunnel').
+ * @property {object} material         Three.js Material-shaped. Duck-types on
+ *                                     .uniforms[name].value.
+ * @property {string[]} watch          Uniform names to capture. Uniforms not
+ *                                     present in material.uniforms are recorded
+ *                                     as null — surfaces silent typos.
+ *
+ * @typedef {object} RenderTargetEntry
+ * @property {string} name
+ * @property {object} target           Three.js WebGLRenderTarget-shaped.
+ *
+ * @typedef {object} AudioTrackEntry
+ * @property {string} track
+ * @property {boolean} isPlaying
+ * @property {number} [currentTime]
+ * @property {number} [volume]
+ *
  * @typedef {object} TakeSceneInventoryOptions
- * @property {object} scene           Three.js Scene-shaped (duck-typed).
- *                                    Must expose .traverseVisible(cb).
- * @property {object} camera          Three.js Camera-shaped. Must expose
- *                                    .projectionMatrix.elements (16 floats)
- *                                    and .matrixWorldInverse.elements OR
- *                                    .matrixWorld.elements (we invert).
- * @property {object} [composer]      Optional. Duck-types on .passes array.
+ * @property {SceneEntry[]} [scenes]   Multi-scene shape. Preferred for hosts
+ *                                     with separate sky / main / HUD scenes.
+ *                                     Each entry contributes meshes / cameras /
+ *                                     lights tagged with source = scene name.
+ * @property {object} [scene]          Legacy single-scene shape. Equivalent to
+ *                                     `scenes: [{ name: 'main', scene, camera }]`.
+ *                                     Provide either { scenes } OR { scene, camera }.
+ * @property {object} [camera]         Companion to `scene` for legacy shape.
+ * @property {object} [composer]       Optional. Duck-types on .passes array.
  * @property {object} [overlayRegistry]
- *                                    Optional createOverlayRegistry() instance.
- * @property {object} [renderer]      Optional. Duck-types on .info.render.
+ *                                     Optional createOverlayRegistry() instance.
+ * @property {object} [renderer]       Optional. Duck-types on .info.render.
+ * @property {MaterialWatchEntry[]} [materials]
+ *                                     Host-declared material watchlist. Each
+ *                                     entry's uniforms[w] for each w in watch
+ *                                     are sampled into inventory.materials[i].uniforms.
+ * @property {Record<string, number>} [clocks]
+ *                                     Named numerical clocks (warp elapsed,
+ *                                     audio beat, autopilot tour timer …).
+ *                                     Non-number values dropped.
+ * @property {Record<string, string>} [modes]
+ *                                     Named string-valued mode flags
+ *                                     ('viewport' → 'system' | 'galaxy' | …).
+ * @property {RenderTargetEntry[]} [renderTargets]
+ *                                     Named render targets (composer ping-pong,
+ *                                     dedicated effect targets …).
+ * @property {Record<string, string>} [phases]
+ *                                     Named state-machine phases (autopilot,
+ *                                     warp, …). Cross-system assertions go
+ *                                     through phaseEquals.
+ * @property {AudioTrackEntry[]} [audio]
+ *                                     Per-track playback state.
+ * @property {object} [input]          Plain JSON-serializable record of
+ *                                     input-layer state ({ 'held-keys': [...],
+ *                                     'last-action': '…' }).
  * @property {string} [meshNamePrefix=''] Filter meshes whose name starts
- *                                    with this prefix. Default: include all.
+ *                                     with this prefix. Default: include all.
  * @property {boolean} [includeBoundingSphere=false]
- *                                    Include boundingSphereRadius per mesh
- *                                    entry. Opt-in because computeBoundingSphere
- *                                    can throw on Points geometry.
+ *                                     Include boundingSphereRadius per mesh
+ *                                     entry. Opt-in because computeBoundingSphere
+ *                                     can throw on Points geometry.
  * @property {boolean} [verbose=false] Emit warnings to stderr/console.warn
- *                                    on empty mesh names. Opt-in for
- *                                    kit-development + first-time host
- *                                    integration; production capture is silent.
+ *                                     on empty mesh names. Opt-in for
+ *                                     kit-development + first-time host
+ *                                     integration; production capture is silent.
  */
 
 /**
@@ -72,113 +129,135 @@
  *
  * Synchronous, no rAF dependency — runs at sim tick before render.
  *
+ * Multi-scene contract: `scenes` is preferred. Each mesh / camera / light entry
+ * carries its origin scene's name in `source`. `composer`, `renderer`,
+ * `overlayRegistry`, and the 7 host-supplied category fields (materials,
+ * clocks, modes, renderTargets, phases, audio, input) are scene-graph-orthogonal
+ * and not source-tagged. Categories that aren't passed are OMITTED from the
+ * returned inventory (not [] / not null) — same opt-in convention as
+ * domOverlays.
+ *
  * @param {TakeSceneInventoryOptions} options
  * @returns {SceneInventory}
  */
 export function takeSceneInventory(options) {
-  if (!options || !options.scene) throw new Error('takeSceneInventory: options.scene required');
-  if (!options.camera) throw new Error('takeSceneInventory: options.camera required');
+  if (!options) throw new Error('takeSceneInventory: options required');
 
-  const scene = options.scene;
-  const camera = options.camera;
+  const scenes = normalizeScenes(options);
   const verbose = !!options.verbose;
   const meshPrefix = options.meshNamePrefix || '';
   const includeBoundingSphere = !!options.includeBoundingSphere;
 
-  if (typeof scene.traverseVisible !== 'function') {
-    throw new Error('takeSceneInventory: scene.traverseVisible() missing — pass a Three.js Scene-shaped object');
-  }
-  if (!camera.projectionMatrix || !camera.projectionMatrix.elements) {
-    throw new Error('takeSceneInventory: camera.projectionMatrix.elements missing — pass a Three.js Camera-shaped object');
-  }
-
-  // Build clip-space matrix: M = projection * matrixWorldInverse
-  // matrixWorldInverse should be current; if missing, derive from matrixWorld.
-  let invE = camera.matrixWorldInverse?.elements;
-  if (!invE) {
-    if (!camera.matrixWorld?.elements) {
-      throw new Error('takeSceneInventory: camera.matrixWorldInverse OR camera.matrixWorld required');
-    }
-    invE = invertMatrix4(camera.matrixWorld.elements);
-  }
-  const projE = camera.projectionMatrix.elements;
-  const clipE = multiplyMatrix4(projE, invE);
-
-  // Extract 6 frustum planes (left, right, bottom, top, near, far) from
-  // clip-space matrix. Gribb-Hartmann row method, normalized.
-  const planes = extractFrustumPlanes(clipE);
-
-  // Capture meshes
+  /** @type {object[]} */
   const meshes = [];
-  scene.traverseVisible((obj) => {
-    // A "renderable" has a geometry property; Group/Object3D bare nodes don't.
-    if (!obj.geometry) return;
-    if (meshPrefix && (obj.name || '').indexOf(meshPrefix) !== 0) return;
+  /** @type {object[]} */
+  const cameras = [];
+  /** @type {object[]} */
+  const lights = [];
+  const seenCameraUuids = new Set();
+  const seenLightUuids = new Set();
 
-    if (verbose && (obj.name === '' || obj.name == null)) {
-      // eslint-disable-next-line no-console
-      console.warn(`[takeSceneInventory] unnamed mesh in scene-graph (uuid=${obj.uuid}, type=${obj.type}). Predicates assert by mesh name; unnamed meshes silently skip.`);
+  for (const entry of scenes) {
+    const { name: source, scene, camera } = entry;
+    if (typeof scene.traverseVisible !== 'function') {
+      throw new Error(`takeSceneInventory: scenes['${source}'].traverseVisible() missing — pass a Three.js Scene-shaped object`);
+    }
+    if (!camera.projectionMatrix || !camera.projectionMatrix.elements) {
+      throw new Error(`takeSceneInventory: scenes['${source}'].camera.projectionMatrix.elements missing — pass a Three.js Camera-shaped object`);
     }
 
-    const matrixWorld = obj.matrixWorld;
-    const mwE = matrixWorld?.elements;
-    const worldPos = mwE
-      ? [mwE[12], mwE[13], mwE[14]]
-      : [
-          obj.position?.x ?? 0,
-          obj.position?.y ?? 0,
-          obj.position?.z ?? 0,
-        ];
-
-    let inFrustum = true;
-    if (obj.frustumCulled !== false) {
-      // Renderer would frustum-cull this; check sphere intersection.
-      const sphere = obj.geometry?.boundingSphere;
-      if (sphere && sphere.center && typeof sphere.radius === 'number') {
-        // Transform sphere center to world space
-        const cwx = mwE
-          ? mwE[0] * sphere.center.x + mwE[4] * sphere.center.y + mwE[8] * sphere.center.z + mwE[12]
-          : sphere.center.x;
-        const cwy = mwE
-          ? mwE[1] * sphere.center.x + mwE[5] * sphere.center.y + mwE[9] * sphere.center.z + mwE[13]
-          : sphere.center.y;
-        const cwz = mwE
-          ? mwE[2] * sphere.center.x + mwE[6] * sphere.center.y + mwE[10] * sphere.center.z + mwE[14]
-          : sphere.center.z;
-        // Scale radius by max scale factor of matrixWorld (estimate)
-        const sx = mwE ? Math.hypot(mwE[0], mwE[1], mwE[2]) : 1;
-        const sy = mwE ? Math.hypot(mwE[4], mwE[5], mwE[6]) : 1;
-        const sz = mwE ? Math.hypot(mwE[8], mwE[9], mwE[10]) : 1;
-        const worldRadius = sphere.radius * Math.max(sx, sy, sz);
-        inFrustum = sphereIntersectsFrustum(cwx, cwy, cwz, worldRadius, planes);
-      } else {
-        // No bounding sphere (or not computed) — conservative assumption: in frustum.
-        // Caller can opt into includeBoundingSphere or precompute on host side.
-        inFrustum = true;
+    // Build clip-space matrix: M = projection * matrixWorldInverse
+    // matrixWorldInverse should be current; if missing, derive from matrixWorld.
+    let invE = camera.matrixWorldInverse?.elements;
+    if (!invE) {
+      if (!camera.matrixWorld?.elements) {
+        throw new Error(`takeSceneInventory: scenes['${source}'].camera.matrixWorldInverse OR matrixWorld required`);
       }
+      invE = invertMatrix4(camera.matrixWorld.elements);
+    }
+    const projE = camera.projectionMatrix.elements;
+    const clipE = multiplyMatrix4(projE, invE);
+    const planes = extractFrustumPlanes(clipE);
+
+    // Capture meshes via traverseVisible (renderable visibility chain).
+    scene.traverseVisible((obj) => {
+      if (!obj.geometry) return;
+      if (meshPrefix && (obj.name || '').indexOf(meshPrefix) !== 0) return;
+
+      if (verbose && (obj.name === '' || obj.name == null)) {
+        // eslint-disable-next-line no-console
+        console.warn(`[takeSceneInventory] unnamed mesh in scene-graph (source='${source}', uuid=${obj.uuid}, type=${obj.type}). Predicates assert by mesh name; unnamed meshes silently skip.`);
+      }
+
+      const mwE = obj.matrixWorld?.elements;
+      const worldPos = mwE
+        ? [mwE[12], mwE[13], mwE[14]]
+        : [obj.position?.x ?? 0, obj.position?.y ?? 0, obj.position?.z ?? 0];
+
+      let inFrustum = true;
+      if (obj.frustumCulled !== false) {
+        const sphere = obj.geometry?.boundingSphere;
+        if (sphere && sphere.center && typeof sphere.radius === 'number') {
+          const cwx = mwE
+            ? mwE[0] * sphere.center.x + mwE[4] * sphere.center.y + mwE[8] * sphere.center.z + mwE[12]
+            : sphere.center.x;
+          const cwy = mwE
+            ? mwE[1] * sphere.center.x + mwE[5] * sphere.center.y + mwE[9] * sphere.center.z + mwE[13]
+            : sphere.center.y;
+          const cwz = mwE
+            ? mwE[2] * sphere.center.x + mwE[6] * sphere.center.y + mwE[10] * sphere.center.z + mwE[14]
+            : sphere.center.z;
+          const sx = mwE ? Math.hypot(mwE[0], mwE[1], mwE[2]) : 1;
+          const sy = mwE ? Math.hypot(mwE[4], mwE[5], mwE[6]) : 1;
+          const sz = mwE ? Math.hypot(mwE[8], mwE[9], mwE[10]) : 1;
+          const worldRadius = sphere.radius * Math.max(sx, sy, sz);
+          inFrustum = sphereIntersectsFrustum(cwx, cwy, cwz, worldRadius, planes);
+        }
+      }
+
+      const meshEntry = {
+        name: obj.name || '',
+        type: obj.type || 'Object3D',
+        uuid: obj.uuid || '',
+        source,
+        visible: !!obj.visible,
+        frustumCulled: obj.frustumCulled !== false,
+        inFrustum,
+        worldPos,
+        layer: (obj.layers?.mask) ?? 1,
+        materialUuid: obj.material?.uuid ?? '',
+        geometryUuid: obj.geometry?.uuid ?? '',
+      };
+      if (includeBoundingSphere && obj.geometry?.boundingSphere?.radius != null) {
+        meshEntry.boundingSphereRadius = obj.geometry.boundingSphere.radius;
+      }
+      meshes.push(meshEntry);
+    });
+
+    // Cameras + lights via traverse (visible-or-not — they don't render
+    // themselves so the visibility chain doesn't apply to *whether to inventory*).
+    if (typeof scene.traverse === 'function') {
+      scene.traverse((obj) => {
+        if (obj.isCamera === true && !seenCameraUuids.has(obj.uuid)) {
+          seenCameraUuids.add(obj.uuid);
+          cameras.push(buildCameraEntry(obj, source));
+        } else if (obj.isLight === true && !seenLightUuids.has(obj.uuid)) {
+          seenLightUuids.add(obj.uuid);
+          lights.push(buildLightEntry(obj, source));
+        }
+      });
     }
 
-    /** @type {MeshInventoryEntry} */
-    const entry = {
-      name: obj.name || '',
-      type: obj.type || 'Object3D',
-      uuid: obj.uuid || '',
-      visible: !!obj.visible,
-      frustumCulled: obj.frustumCulled !== false,
-      inFrustum,
-      worldPos,
-      layer: (obj.layers?.mask) ?? 1,
-      materialUuid: obj.material?.uuid ?? '',
-      geometryUuid: obj.geometry?.uuid ?? '',
-    };
-    if (includeBoundingSphere && obj.geometry?.boundingSphere?.radius != null) {
-      entry.boundingSphereRadius = obj.geometry.boundingSphere.radius;
+    // Always include the explicitly-passed camera for this scene if not
+    // already collected (cameras typically aren't on the scene-graph).
+    if (camera.uuid && !seenCameraUuids.has(camera.uuid)) {
+      seenCameraUuids.add(camera.uuid);
+      cameras.push(buildCameraEntry(camera, source));
     }
-    meshes.push(entry);
-  });
+  }
 
   /** @type {SceneInventory} */
-  const inv = { meshes };
+  const inv = { meshes, cameras, lights };
 
   // Composer passes
   if (options.composer && Array.isArray(options.composer.passes)) {
@@ -211,7 +290,221 @@ export function takeSceneInventory(options) {
     inv.domOverlays = options.overlayRegistry.snapshot();
   }
 
+  // Host-supplied categories — opt-in (omit when not provided).
+  if (options.materials != null) inv.materials = captureMaterials(options.materials);
+  if (options.clocks != null) inv.clocks = captureRecord(options.clocks, 'clocks', 'number');
+  if (options.modes != null) inv.modes = captureRecord(options.modes, 'modes', 'string');
+  if (options.renderTargets != null) inv.renderTargets = captureRenderTargets(options.renderTargets);
+  if (options.phases != null) inv.phases = captureRecord(options.phases, 'phases', 'string');
+  if (options.audio != null) inv.audio = captureAudio(options.audio);
+  if (options.input != null) inv.input = captureInput(options.input);
+
   return inv;
+}
+
+// ── Multi-scene normalization ───────────────────────────────────────────
+
+function normalizeScenes(options) {
+  if (Array.isArray(options.scenes)) {
+    if (options.scenes.length === 0) {
+      throw new Error('takeSceneInventory: scenes array must contain at least one entry');
+    }
+    const seen = new Set();
+    for (const s of options.scenes) {
+      if (!s || typeof s.name !== 'string' || s.name.length === 0) {
+        throw new Error('takeSceneInventory: each scenes[] entry must have a string `name`');
+      }
+      if (seen.has(s.name)) {
+        throw new Error(`takeSceneInventory: duplicate scene name '${s.name}' in scenes[]`);
+      }
+      seen.add(s.name);
+      if (!s.scene) throw new Error(`takeSceneInventory: scenes['${s.name}'].scene required`);
+      if (!s.camera) throw new Error(`takeSceneInventory: scenes['${s.name}'].camera required`);
+    }
+    return options.scenes;
+  }
+  if (options.scene && options.camera) {
+    return [{ name: 'main', scene: options.scene, camera: options.camera }];
+  }
+  throw new Error('takeSceneInventory: provide either { scenes: [...] } or { scene, camera }');
+}
+
+// ── Camera + light entry builders ───────────────────────────────────────
+
+function buildCameraEntry(cam, source) {
+  const mwE = cam.matrixWorld?.elements;
+  const worldPos = mwE
+    ? [mwE[12], mwE[13], mwE[14]]
+    : [cam.position?.x ?? 0, cam.position?.y ?? 0, cam.position?.z ?? 0];
+  const isOrtho = cam.isOrthographicCamera === true;
+  return {
+    name: cam.name || '',
+    type: cam.type || (cam.isPerspectiveCamera ? 'PerspectiveCamera' : isOrtho ? 'OrthographicCamera' : 'Camera'),
+    uuid: cam.uuid || '',
+    source,
+    fov: typeof cam.fov === 'number' ? cam.fov : null,
+    aspect: typeof cam.aspect === 'number' ? cam.aspect : null,
+    near: typeof cam.near === 'number' ? cam.near : null,
+    far: typeof cam.far === 'number' ? cam.far : null,
+    isOrthographic: isOrtho,
+    worldPos,
+  };
+}
+
+function buildLightEntry(light, source) {
+  const mwE = light.matrixWorld?.elements;
+  const worldPos = mwE
+    ? [mwE[12], mwE[13], mwE[14]]
+    : [light.position?.x ?? 0, light.position?.y ?? 0, light.position?.z ?? 0];
+  let color = '';
+  if (light.color) {
+    if (typeof light.color.getHexString === 'function') {
+      color = light.color.getHexString();
+    } else if (typeof light.color === 'number') {
+      color = (light.color >>> 0).toString(16).padStart(6, '0');
+    } else if (typeof light.color.r === 'number') {
+      const r = Math.round((light.color.r ?? 0) * 255);
+      const g = Math.round((light.color.g ?? 0) * 255);
+      const b = Math.round((light.color.b ?? 0) * 255);
+      color = ((r << 16) | (g << 8) | b).toString(16).padStart(6, '0');
+    }
+  }
+  return {
+    name: light.name || '',
+    type: light.type || 'Light',
+    uuid: light.uuid || '',
+    source,
+    visible: light.visible !== false,
+    intensity: typeof light.intensity === 'number' ? light.intensity : 1,
+    color,
+    worldPos,
+  };
+}
+
+// ── Host-supplied capture helpers ───────────────────────────────────────
+
+function captureMaterials(materialsList) {
+  if (!Array.isArray(materialsList)) {
+    throw new Error('takeSceneInventory: materials must be an array of { role, material, watch }');
+  }
+  return materialsList.map(({ role, material, watch }) => {
+    if (typeof role !== 'string' || role.length === 0) {
+      throw new Error('takeSceneInventory: materials[i].role must be a non-empty string');
+    }
+    const uniforms = {};
+    if (Array.isArray(watch) && material?.uniforms) {
+      for (const uName of watch) {
+        if (typeof uName !== 'string') continue;
+        if (Object.prototype.hasOwnProperty.call(material.uniforms, uName)) {
+          const u = material.uniforms[uName];
+          uniforms[uName] = serializeUniformValue(u && Object.prototype.hasOwnProperty.call(u, 'value') ? u.value : u);
+        } else {
+          // Declared in watch but not present on material. Surface as null
+          // so uniformValueAt distinguishes missing-from-material vs
+          // present-but-mismatch.
+          uniforms[uName] = null;
+        }
+      }
+    }
+    return {
+      role,
+      uniforms,
+      transparent: !!material?.transparent,
+      depthTest: material?.depthTest !== false,
+      depthWrite: material?.depthWrite !== false,
+      blending: typeof material?.blending === 'number' ? material.blending : null,
+      visible: material?.visible !== false,
+    };
+  });
+}
+
+function serializeUniformValue(v) {
+  if (v == null) return null;
+  const t = typeof v;
+  if (t === 'number' || t === 'boolean' || t === 'string') return v;
+  if (Array.isArray(v)) {
+    const out = [];
+    const n = Math.min(v.length, 16);
+    for (let i = 0; i < n; i++) out.push(serializeUniformValue(v[i]));
+    return out;
+  }
+  if (typeof v.x === 'number') {
+    const out = { x: v.x };
+    if (typeof v.y === 'number') out.y = v.y;
+    if (typeof v.z === 'number') out.z = v.z;
+    if (typeof v.w === 'number') out.w = v.w;
+    return out;
+  }
+  if (typeof v.r === 'number' && typeof v.g === 'number' && typeof v.b === 'number') {
+    return { r: v.r, g: v.g, b: v.b };
+  }
+  if (typeof v.uuid === 'string') {
+    return { uuid: v.uuid, name: v.name || '', type: v.type || 'Texture' };
+  }
+  if (typeof v.length === 'number' && (v instanceof Float32Array || v instanceof Float64Array || v instanceof Int32Array)) {
+    return { length: v.length, _kind: 'TypedArray' };
+  }
+  return { _kind: 'unserialized' };
+}
+
+function captureRecord(record, label, valueType) {
+  if (typeof record !== 'object' || record === null || Array.isArray(record)) {
+    throw new Error(`takeSceneInventory: ${label} must be a plain object Record<key, ${valueType}>`);
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(record)) {
+    if (typeof v === valueType) out[k] = v;
+  }
+  return out;
+}
+
+function captureRenderTargets(rtList) {
+  if (!Array.isArray(rtList)) {
+    throw new Error('takeSceneInventory: renderTargets must be an array of { name, target }');
+  }
+  return rtList.map(({ name, target }) => {
+    if (typeof name !== 'string' || name.length === 0) {
+      throw new Error('takeSceneInventory: renderTargets[i].name must be a non-empty string');
+    }
+    return {
+      name,
+      width: typeof target?.width === 'number' ? target.width : 0,
+      height: typeof target?.height === 'number' ? target.height : 0,
+      depthBuffer: target?.depthBuffer !== false,
+      samples: typeof target?.samples === 'number' ? target.samples : 0,
+      textureUuid: typeof target?.texture?.uuid === 'string' ? target.texture.uuid : '',
+    };
+  });
+}
+
+function captureAudio(audioList) {
+  if (!Array.isArray(audioList)) {
+    throw new Error('takeSceneInventory: audio must be an array of { track, isPlaying, ... }');
+  }
+  return audioList.map((a) => {
+    if (typeof a?.track !== 'string' || a.track.length === 0) {
+      throw new Error('takeSceneInventory: audio[i].track must be a non-empty string');
+    }
+    return {
+      track: a.track,
+      isPlaying: !!a.isPlaying,
+      currentTime: typeof a.currentTime === 'number' ? a.currentTime : 0,
+      volume: typeof a.volume === 'number' ? a.volume : 0,
+    };
+  });
+}
+
+function captureInput(input) {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) {
+    throw new Error('takeSceneInventory: input must be a plain object Record<kind, JSON-value>');
+  }
+  // Roundtrip through JSON to enforce purity. Host may pass cyclic / non-
+  // JSON values; fail loudly rather than silently corrupting the snapshot.
+  try {
+    return JSON.parse(JSON.stringify(input));
+  } catch (e) {
+    throw new Error(`takeSceneInventory: input is not JSON-serializable: ${e.message}`);
+  }
 }
 
 // ── Frustum math helpers (inlined to keep adapter THREE-import-free) ────
