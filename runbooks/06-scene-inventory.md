@@ -162,6 +162,68 @@ violation and the underlying inventory dump.
    loudly, not silently). r183+ adapter is forward work documented in
    `core/inventory/inventory-shape.md` §"Composer compatibility".
 
+## Multi-scene API + 9 categories (welldipper-scene-inspection-layer Phase 1, 2026-05-07)
+
+The kit-side API gained two extensions in service of the welldipper-
+scene-inspection-layer workstream. Both are back-compat: legacy single-
+scene callers still work without changes.
+
+### Multi-scene capture
+
+```js
+takeSceneInventory({
+  scenes: [
+    { name: 'main', scene: mainScene, camera: mainCamera },
+    { name: 'sky',  scene: skyScene,  camera: skyCamera  },
+  ],
+  composer, overlayRegistry, renderer,
+});
+```
+
+Every mesh / camera / light entry is tagged with `source: '<scene name>'`.
+Predicates default to "search across all sources"; opt-in
+`{ source: 'sky' }` to scope. Existing single-scene calls (`{ scene, camera }`)
+are equivalent to `scenes: [{ name: 'main', scene, camera }]`; their
+mesh entries get `source: 'main'`.
+
+### 9 host-supplied categories
+
+Each category is opt-in. When not passed, the field is omitted from the
+inventory (same convention as `domOverlays`, `composerPasses`,
+`rendererInfo`). When passed, the inventory exposes the corresponding
+top-level field.
+
+| Category | Option shape | Predicate |
+|---|---|---|
+| `cameras` | auto-traversed via `.isCamera` duck-type | `cameraConfigAt` |
+| `lights` | auto-traversed via `.isLight` duck-type | `lightActiveAt` |
+| `materials` | `[{ role, material, watch: ['uTime', ...] }]` | `uniformValueAt` |
+| `clocks` | `Record<string, number>` | `clockProgressedSince` |
+| `modes` | `Record<string, string>` | `modeIs` |
+| `renderTargets` | `[{ name, target }]` | `renderTargetSize` |
+| `phases` | `Record<string, string>` | `phaseEquals` |
+| `audio` | `[{ track, isPlaying, currentTime, volume }]` | `audioPlayingAt` |
+| `input` | plain JSON-serializable record | `inputContains` |
+
+Cameras and lights are always present (may be empty arrays). The other
+seven are opt-in.
+
+### Materials watchlist semantics
+
+A uniform declared in `watch` but absent on the material at capture time
+is recorded as `null`. `uniformValueAt` distinguishes three failure modes:
+"role not found," "uniform not in watchlist," and "uniform declared in
+watch but absent on material." The third surfaces silent typos in uniform
+names without losing the diagnostic lead.
+
+### Bit-stable hash test
+
+`fnv1aString(systemSeed + ':' + ordinal)` is the kit's recommended
+ID-construction scheme for procedural entities (planets, npcs, asteroids).
+`tests/hash.test.js` pins canonical hex outputs for fixed seed:ordinal
+inputs — refactoring the hash function fails the test loudly, becoming
+a deliberate save-migration decision rather than an accidental drift.
+
 ## Cross-references
 
 - `~/.claude/projects/-home-ax/memory/feedback_lab-modes-not-recordings.md` —
@@ -171,6 +233,12 @@ violation and the underlying inventory dump.
   for.
 - `docs/WORKSTREAMS/motion-test-kit-scene-inventory-2026-05-05.md` —
   technique origin + acceptance criteria.
+- `docs/WORKSTREAMS/welldipper-scene-inspection-layer-2026-05-06.md` —
+  Phase 1 of this workstream introduced the multi-scene + 9-category
+  extensions; Phase 2 applied canonical naming in well-dipper; Phase 3
+  added the `window.__wd` runtime inspector (well-dipper-side, gated by
+  `import.meta.env.DEV`) — see well-dipper's `src/debug/SceneInspector.js`
+  for the Tier 1 + Tier 2 reference implementation.
 - `docs/WORKSTREAMS/welldipper-lab-mode-2026-05-05.md` — parallel-sibling
   workstream that lays the felt-experience surface using the same per-
   phase inventory.
