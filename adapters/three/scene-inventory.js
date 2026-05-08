@@ -118,6 +118,17 @@
  *                                     Include boundingSphereRadius per mesh
  *                                     entry. Opt-in because computeBoundingSphere
  *                                     can throw on Points geometry.
+ * @property {{ width: number, height: number }} [viewport]
+ *                                     Optional canvas viewport in pixels. When
+ *                                     provided, every mesh entry gains
+ *                                     screenSpace / projectedSize /
+ *                                     apparentDegrees / estimatedPixelCoverage /
+ *                                     cameraDistance / realFrustumIntersect
+ *                                     fields. When absent, those fields are
+ *                                     omitted (backward-compat). Pass
+ *                                     `{ width: renderer.domElement.clientWidth,
+ *                                       height: renderer.domElement.clientHeight }`
+ *                                     from a Three.js host.
  * @property {boolean} [verbose=false] Emit warnings to stderr/console.warn
  *                                     on empty mesh names. Opt-in for
  *                                     kit-development + first-time host
@@ -147,6 +158,7 @@ export function takeSceneInventory(options) {
   const verbose = !!options.verbose;
   const meshPrefix = options.meshNamePrefix || '';
   const includeBoundingSphere = !!options.includeBoundingSphere;
+  const viewport = normalizeViewport(options.viewport);
 
   /** @type {object[]} */
   const meshes = [];
@@ -178,6 +190,25 @@ export function takeSceneInventory(options) {
     const projE = camera.projectionMatrix.elements;
     const clipE = multiplyMatrix4(projE, invE);
     const planes = extractFrustumPlanes(clipE);
+
+    // Camera world position (needed for cameraDistance + apparentDegrees).
+    // Prefer matrixWorld translation; if only matrixWorldInverse was supplied
+    // and we inverted it above, we have invE but not the original — derive
+    // by inverting again when needed.
+    let camWorldPos = null;
+    if (viewport) {
+      const camMwE = camera.matrixWorld?.elements;
+      if (camMwE) {
+        camWorldPos = [camMwE[12], camMwE[13], camMwE[14]];
+      } else {
+        // We have invE = matrixWorldInverse.elements; invert it back.
+        const camMw = invertMatrix4(invE);
+        camWorldPos = camMw ? [camMw[12], camMw[13], camMw[14]] : [0, 0, 0];
+      }
+    }
+    const cameraFovRad = viewport && typeof camera.fov === 'number'
+      ? camera.fov * Math.PI / 180
+      : null;
 
     // Capture meshes via traverseVisible (renderable visibility chain).
     scene.traverseVisible((obj) => {
@@ -231,6 +262,87 @@ export function takeSceneInventory(options) {
       if (includeBoundingSphere && obj.geometry?.boundingSphere?.radius != null) {
         meshEntry.boundingSphereRadius = obj.geometry.boundingSphere.radius;
       }
+
+      // Phase A v2: cheap analytic primitives. Gated on viewport presence.
+      if (viewport) {
+        const dx = worldPos[0] - camWorldPos[0];
+        const dy = worldPos[1] - camWorldPos[1];
+        const dz = worldPos[2] - camWorldPos[2];
+        const cameraDistance = Math.hypot(dx, dy, dz);
+        meshEntry.cameraDistance = cameraDistance;
+
+        meshEntry.screenSpace = projectPoint(
+          worldPos[0], worldPos[1], worldPos[2], clipE, viewport
+        );
+
+        // Bounding sphere — apparentDegrees + estimatedPixelCoverage.
+        const sphere = obj.geometry?.boundingSphere;
+        if (sphere && typeof sphere.radius === 'number' && sphere.radius >= 0) {
+          // worldRadius (max-scale approx) — same convention as inFrustum above.
+          const sx = mwE ? Math.hypot(mwE[0], mwE[1], mwE[2]) : 1;
+          const sy = mwE ? Math.hypot(mwE[4], mwE[5], mwE[6]) : 1;
+          const sz = mwE ? Math.hypot(mwE[8], mwE[9], mwE[10]) : 1;
+          const worldR = sphere.radius * Math.max(sx, sy, sz);
+          if (cameraDistance <= 0) {
+            meshEntry.apparentDegrees = 180;
+          } else if (worldR <= 0) {
+            meshEntry.apparentDegrees = 0;
+          } else {
+            // Note: when worldR > cameraDistance (camera inside the sphere)
+            // 2*atan(r/d) clamps gracefully; angular fills the view.
+            meshEntry.apparentDegrees = 2 * Math.atan(worldR / cameraDistance) * 180 / Math.PI;
+          }
+          // estimatedPixelCoverage from angular size (cross-check vs projectedSize).
+          if (cameraFovRad && cameraFovRad > 0 && cameraDistance > 0) {
+            const apparentRad = 2 * Math.atan(worldR / cameraDistance);
+            // Solid-angle-ish circle area: pi * (radiusInPixels)^2
+            const radiusInPixelsY = (apparentRad / cameraFovRad) * (viewport.height / 2);
+            meshEntry.estimatedPixelCoverage = Math.PI * radiusInPixelsY * radiusInPixelsY;
+          } else {
+            meshEntry.estimatedPixelCoverage = null;
+          }
+        } else {
+          meshEntry.apparentDegrees = null;
+          meshEntry.estimatedPixelCoverage = null;
+        }
+
+        // Bounding box — projectedSize + realFrustumIntersect (precise).
+        const bbox = obj.geometry?.boundingBox;
+        let realFrustumIntersect = inFrustum;
+        if (bbox && bbox.min && bbox.max) {
+          const corners = transformAABBCorners(bbox.min, bbox.max, mwE);
+          // Precise box-vs-frustum: any plane fully behind 8 corners → outside.
+          realFrustumIntersect = boxIntersectsFrustum(corners, planes);
+
+          // Project corners → screen-space AABB.
+          let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+          let anyInFront = false;
+          for (let i = 0; i < 8; i++) {
+            const p = projectPoint(
+              corners[i * 3], corners[i * 3 + 1], corners[i * 3 + 2],
+              clipE, viewport
+            );
+            if (p && p.behindCamera === false) {
+              anyInFront = true;
+              if (p.x < minX) minX = p.x;
+              if (p.x > maxX) maxX = p.x;
+              if (p.y < minY) minY = p.y;
+              if (p.y > maxY) maxY = p.y;
+            }
+          }
+          if (anyInFront && Number.isFinite(minX)) {
+            const w = maxX - minX;
+            const h = maxY - minY;
+            meshEntry.projectedSize = { width: w, height: h, pixelArea: w * h };
+          } else {
+            meshEntry.projectedSize = null;
+          }
+        } else {
+          meshEntry.projectedSize = null;
+        }
+        meshEntry.realFrustumIntersect = realFrustumIntersect;
+      }
+
       meshes.push(meshEntry);
     });
 
@@ -505,6 +617,125 @@ function captureInput(input) {
   } catch (e) {
     throw new Error(`takeSceneInventory: input is not JSON-serializable: ${e.message}`);
   }
+}
+
+// ── Phase A v2 helpers (screen-space, projection, box-vs-frustum) ───────
+
+/**
+ * Normalize the optional viewport option into { width, height } or null.
+ * @param {{ width?: number, height?: number } | undefined} v
+ * @returns {{ width: number, height: number } | null}
+ */
+export function normalizeViewport(v) {
+  if (v == null) return null;
+  if (typeof v.width !== 'number' || typeof v.height !== 'number') {
+    throw new Error('takeSceneInventory: viewport must be { width: number, height: number }');
+  }
+  if (!(v.width > 0) || !(v.height > 0)) {
+    throw new Error(`takeSceneInventory: viewport.width and viewport.height must be > 0 (got ${v.width}x${v.height})`);
+  }
+  return { width: v.width, height: v.height };
+}
+
+/**
+ * Project a single world-space point through a clip-space matrix into pixel
+ * coordinates. Returns null if the projection w-coordinate is exactly zero
+ * (degenerate camera matrix).
+ *
+ * Coordinate convention: pixel x grows right; pixel y grows DOWN (matches
+ * canvas / DOM). NDC y → pixel y is flipped.
+ *
+ * Behind-camera handling: when w <= 0 the point is behind or on the near
+ * clip plane; we still emit numeric x/y (extrapolated by perspective divide)
+ * but flag `behindCamera: true` and set `inViewport: false`.
+ *
+ * @param {number} x
+ * @param {number} y
+ * @param {number} z
+ * @param {ArrayLike<number>} clipE 16-element column-major clip matrix
+ * @param {{ width: number, height: number }} viewport
+ * @returns {{ x: number, y: number, depth: number, inViewport: boolean, behindCamera: boolean } | null}
+ */
+export function projectPoint(x, y, z, clipE, viewport) {
+  const cx = clipE[0] * x + clipE[4] * y + clipE[8] * z + clipE[12];
+  const cy = clipE[1] * x + clipE[5] * y + clipE[9] * z + clipE[13];
+  const cz = clipE[2] * x + clipE[6] * y + clipE[10] * z + clipE[14];
+  const cw = clipE[3] * x + clipE[7] * y + clipE[11] * z + clipE[15];
+  if (cw === 0) return null;
+  const invW = 1 / cw;
+  const ndcX = cx * invW;
+  const ndcY = cy * invW;
+  const ndcZ = cz * invW;
+  const px = (ndcX * 0.5 + 0.5) * viewport.width;
+  const py = (-ndcY * 0.5 + 0.5) * viewport.height;
+  const behindCamera = cw <= 0;
+  const inViewport = !behindCamera
+    && px >= 0 && px <= viewport.width
+    && py >= 0 && py <= viewport.height
+    && ndcZ >= -1 && ndcZ <= 1;
+  return { x: px, y: py, depth: ndcZ, inViewport, behindCamera };
+}
+
+/**
+ * Transform the 8 corners of a local-space axis-aligned bounding box by a
+ * world matrix and return them flat as [x0,y0,z0, x1,y1,z1, ..., x7,y7,z7].
+ *
+ * @param {{ x: number, y: number, z: number }} min
+ * @param {{ x: number, y: number, z: number }} max
+ * @param {ArrayLike<number> | undefined} mwE 16-element column-major world matrix; identity if missing
+ * @returns {Float64Array} 24 floats (8 corners * 3)
+ */
+export function transformAABBCorners(min, max, mwE) {
+  const out = new Float64Array(24);
+  // 8 local corners — combos of (min/max).x × (min/max).y × (min/max).z
+  const lx = [min.x, max.x];
+  const ly = [min.y, max.y];
+  const lz = [min.z, max.z];
+  let i = 0;
+  for (let xi = 0; xi < 2; xi++) {
+    for (let yi = 0; yi < 2; yi++) {
+      for (let zi = 0; zi < 2; zi++) {
+        const x = lx[xi], y = ly[yi], z = lz[zi];
+        if (mwE) {
+          out[i] = mwE[0] * x + mwE[4] * y + mwE[8] * z + mwE[12];
+          out[i + 1] = mwE[1] * x + mwE[5] * y + mwE[9] * z + mwE[13];
+          out[i + 2] = mwE[2] * x + mwE[6] * y + mwE[10] * z + mwE[14];
+        } else {
+          out[i] = x;
+          out[i + 1] = y;
+          out[i + 2] = z;
+        }
+        i += 3;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Test whether the AABB defined by 8 world-space corners intersects the frustum.
+ * Per-plane reject test: if all 8 corners are behind a single plane the box
+ * is fully outside. Otherwise considered intersecting (may include some
+ * false-positives where the box clips a frustum edge but no corner is
+ * inside — same approximation Three.js Frustum.intersectsBox makes).
+ *
+ * @param {ArrayLike<number>} corners 24 floats from transformAABBCorners
+ * @param {Float64Array} planes 24 floats from extractFrustumPlanes
+ * @returns {boolean}
+ */
+export function boxIntersectsFrustum(corners, planes) {
+  for (let p = 0; p < 6; p++) {
+    const o = p * 4;
+    const a = planes[o], b = planes[o + 1], c = planes[o + 2], d = planes[o + 3];
+    let allBehind = true;
+    for (let i = 0; i < 8; i++) {
+      const ci = i * 3;
+      const dist = a * corners[ci] + b * corners[ci + 1] + c * corners[ci + 2] + d;
+      if (dist >= 0) { allBehind = false; break; }
+    }
+    if (allBehind) return false;
+  }
+  return true;
 }
 
 // ── Frustum math helpers (inlined to keep adapter THREE-import-free) ────
