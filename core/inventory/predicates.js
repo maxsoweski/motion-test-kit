@@ -594,3 +594,214 @@ export function inputContains(inventoriesByPhase, options) {
   }
   return { passed: violations.length === 0, violations, totalSamples: 1 };
 }
+
+// ─── Phase A v2 screen-space predicates ─────────────────────────────────
+//
+// Require the host to have called takeSceneInventory with `viewport`. If
+// the inventory doesn't have screen-space data on the matched mesh entry,
+// the predicate throws a MissingInventoryFieldError so the caller hears
+// "host didn't pass viewport" cleanly.
+
+function requireScreenSpaceField(predicateName, entry, fieldPath) {
+  if (entry == null || entry[fieldPath] === undefined) {
+    throw new MissingInventoryFieldError(predicateName, -1, `mesh.${fieldPath}`);
+  }
+}
+
+/**
+ * Assert a named mesh is visible to the user on the screen at the given phase.
+ *
+ * "On screen" means: screenSpace.inViewport === true AND realFrustumIntersect
+ * === true AND projectedSize.pixelArea >= options.minPixelArea (default 1).
+ *
+ * @param {Map<string, object>} inventoriesByPhase
+ * @param {{ phaseKey: string, meshName: string, source?: string, minPixelArea?: number }} options
+ */
+export function meshOnScreen(inventoriesByPhase, options) {
+  if (!options?.phaseKey || !options?.meshName) {
+    throw new Error('meshOnScreen: options.phaseKey and options.meshName required');
+  }
+  const minPixelArea = options.minPixelArea ?? 1;
+  const inv = getInventory(inventoriesByPhase, options.phaseKey, 'meshOnScreen');
+  if (!Array.isArray(inv.meshes)) {
+    throw new MissingInventoryFieldError('meshOnScreen', -1, 'inventory.meshes');
+  }
+  const { entry, hasUnnamed } = findMesh(inv.meshes, options.meshName, options.source);
+  const violations = [];
+  if (!entry) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: hasUnnamed ? 'mesh not found at phase (unnamed meshes present)' : 'mesh not found at phase',
+      meshName: options.meshName,
+      source: options.source,
+    });
+    return { passed: false, violations, totalSamples: 1 };
+  }
+  requireScreenSpaceField('meshOnScreen', entry, 'screenSpace');
+  requireScreenSpaceField('meshOnScreen', entry, 'realFrustumIntersect');
+
+  const reasons = [];
+  if (!entry.screenSpace.inViewport) reasons.push('screenSpace.inViewport=false');
+  if (!entry.realFrustumIntersect) reasons.push('realFrustumIntersect=false');
+  if (entry.projectedSize == null) {
+    if (minPixelArea > 0) reasons.push('projectedSize is null (no boundingBox on geometry)');
+  } else if (entry.projectedSize.pixelArea < minPixelArea) {
+    reasons.push(`projectedSize.pixelArea=${entry.projectedSize.pixelArea} < minPixelArea=${minPixelArea}`);
+  }
+  if (reasons.length > 0) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: reasons.join('; '),
+      meshName: options.meshName,
+      source: options.source,
+      entry,
+    });
+  }
+  return { passed: violations.length === 0, violations, totalSamples: 1 };
+}
+
+/**
+ * Assert a named mesh's screenSpace position falls within a viewport region.
+ *
+ * Region modes:
+ *   - { region: 'center' | 'top' | 'bottom' | 'left' | 'right', tolerance?: number }
+ *     Tolerance is fractional (0..1) — fraction of viewport extent.
+ *   - { x: number, y: number, tolerance: number } — pixel coords + pixel tolerance.
+ *
+ * Note: caller must know the viewport size (carried in inv.cameras[0] context
+ * is not enforced — the predicate evaluates entry.screenSpace.x / .y directly,
+ * which are already pixel coords).
+ *
+ * @param {Map<string, object>} inventoriesByPhase
+ * @param {{ phaseKey: string, meshName: string, source?: string,
+ *   region?: 'center' | 'top' | 'bottom' | 'left' | 'right',
+ *   x?: number, y?: number, tolerance?: number,
+ *   viewport?: { width: number, height: number }
+ * }} options
+ */
+export function meshAtViewportPosition(inventoriesByPhase, options) {
+  if (!options?.phaseKey || !options?.meshName) {
+    throw new Error('meshAtViewportPosition: options.phaseKey and options.meshName required');
+  }
+  const inv = getInventory(inventoriesByPhase, options.phaseKey, 'meshAtViewportPosition');
+  if (!Array.isArray(inv.meshes)) {
+    throw new MissingInventoryFieldError('meshAtViewportPosition', -1, 'inventory.meshes');
+  }
+  const { entry } = findMesh(inv.meshes, options.meshName, options.source);
+  const violations = [];
+  if (!entry) {
+    violations.push({ phase: options.phaseKey, reason: 'mesh not found at phase', meshName: options.meshName });
+    return { passed: false, violations, totalSamples: 1 };
+  }
+  requireScreenSpaceField('meshAtViewportPosition', entry, 'screenSpace');
+
+  let targetX, targetY, tolerancePx;
+  if (options.region) {
+    if (!options.viewport || !(options.viewport.width > 0) || !(options.viewport.height > 0)) {
+      throw new Error('meshAtViewportPosition: region mode requires options.viewport={width,height}');
+    }
+    const tol = options.tolerance ?? 0.1;
+    const w = options.viewport.width, h = options.viewport.height;
+    const cx = w / 2, cy = h / 2;
+    if (options.region === 'center') { targetX = cx; targetY = cy; tolerancePx = Math.min(w, h) * tol; }
+    else if (options.region === 'top') { targetX = cx; targetY = h * tol; tolerancePx = Math.min(w, h) * tol; }
+    else if (options.region === 'bottom') { targetX = cx; targetY = h * (1 - tol); tolerancePx = Math.min(w, h) * tol; }
+    else if (options.region === 'left') { targetX = w * tol; targetY = cy; tolerancePx = Math.min(w, h) * tol; }
+    else if (options.region === 'right') { targetX = w * (1 - tol); targetY = cy; tolerancePx = Math.min(w, h) * tol; }
+    else throw new Error(`meshAtViewportPosition: unknown region '${options.region}'`);
+  } else if (typeof options.x === 'number' && typeof options.y === 'number') {
+    targetX = options.x;
+    targetY = options.y;
+    tolerancePx = options.tolerance ?? 50;
+  } else {
+    throw new Error('meshAtViewportPosition: provide either { region } or { x, y, tolerance }');
+  }
+  const dx = entry.screenSpace.x - targetX;
+  const dy = entry.screenSpace.y - targetY;
+  const dist = Math.hypot(dx, dy);
+  if (dist > tolerancePx) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: `screen-position ${dist.toFixed(1)}px from target (target=(${targetX.toFixed(1)},${targetY.toFixed(1)}), tolerance=${tolerancePx.toFixed(1)})`,
+      meshName: options.meshName,
+      screenSpace: entry.screenSpace,
+    });
+  }
+  return { passed: violations.length === 0, violations, totalSamples: 1 };
+}
+
+/**
+ * Assert a named mesh's apparentDegrees is within bounds.
+ *
+ * @param {Map<string, object>} inventoriesByPhase
+ * @param {{ phaseKey: string, meshName: string, source?: string, min?: number, max?: number }} options
+ */
+export function meshApparentSize(inventoriesByPhase, options) {
+  if (!options?.phaseKey || !options?.meshName) {
+    throw new Error('meshApparentSize: options.phaseKey and options.meshName required');
+  }
+  const inv = getInventory(inventoriesByPhase, options.phaseKey, 'meshApparentSize');
+  const { entry } = findMesh(inv.meshes ?? [], options.meshName, options.source);
+  const violations = [];
+  if (!entry) {
+    violations.push({ phase: options.phaseKey, reason: 'mesh not found at phase', meshName: options.meshName });
+    return { passed: false, violations, totalSamples: 1 };
+  }
+  requireScreenSpaceField('meshApparentSize', entry, 'apparentDegrees');
+  if (entry.apparentDegrees == null) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: 'apparentDegrees is null (no boundingSphere on geometry — pass includeBoundingSphere or compute it)',
+      meshName: options.meshName,
+    });
+    return { passed: false, violations, totalSamples: 1 };
+  }
+  const min = options.min ?? -Infinity;
+  const max = options.max ?? Infinity;
+  if (entry.apparentDegrees < min || entry.apparentDegrees > max) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: `apparentDegrees=${entry.apparentDegrees.toFixed(2)} outside [${min}, ${max}]`,
+      meshName: options.meshName,
+      apparentDegrees: entry.apparentDegrees,
+    });
+  }
+  return { passed: violations.length === 0, violations, totalSamples: 1 };
+}
+
+/**
+ * Assert a named entity's cameraDistance is below a maximum (i.e., the camera
+ * is "near" it).
+ *
+ * Use case: catch the "system entered but camera nowhere near the system's
+ * primary body" defect class. e.g. cameraNear({ meshName: 'body.planet.earth',
+ * maxDistance: 100000 }) FAILs if camera is 100M units from earth.
+ *
+ * @param {Map<string, object>} inventoriesByPhase
+ * @param {{ phaseKey: string, meshName: string, source?: string, maxDistance: number }} options
+ */
+export function cameraNear(inventoriesByPhase, options) {
+  if (!options?.phaseKey || !options?.meshName) {
+    throw new Error('cameraNear: options.phaseKey and options.meshName required');
+  }
+  if (!(options.maxDistance > 0)) {
+    throw new Error('cameraNear: options.maxDistance must be > 0');
+  }
+  const inv = getInventory(inventoriesByPhase, options.phaseKey, 'cameraNear');
+  const { entry } = findMesh(inv.meshes ?? [], options.meshName, options.source);
+  const violations = [];
+  if (!entry) {
+    violations.push({ phase: options.phaseKey, reason: 'mesh not found at phase', meshName: options.meshName });
+    return { passed: false, violations, totalSamples: 1 };
+  }
+  requireScreenSpaceField('cameraNear', entry, 'cameraDistance');
+  if (entry.cameraDistance > options.maxDistance) {
+    violations.push({
+      phase: options.phaseKey,
+      reason: `cameraDistance=${entry.cameraDistance.toFixed(1)} > maxDistance=${options.maxDistance}`,
+      meshName: options.meshName,
+      cameraDistance: entry.cameraDistance,
+    });
+  }
+  return { passed: violations.length === 0, violations, totalSamples: 1 };
+}
